@@ -92,6 +92,17 @@ class DesktopDrop {
         _notifyEvent(DropExitEvent(location: _offset ?? Offset.zero));
         _offset = null;
         break;
+      case "dropReceived":
+        // Fired immediately when drop occurs, before processing begins.
+        // Allows app to show instant feedback like "Preparing import..."
+        final args = call.arguments as List;
+        final itemCount = args[0] as int;
+        final position = (args[1] as List).cast<double>();
+        _notifyEvent(DropReceivedEvent(
+          location: Offset(position[0], position[1]),
+          itemCount: itemCount,
+        ));
+        break;
       case "performOperation":
         final paths = (call.arguments as List).cast<String>();
         _notifyEvent(

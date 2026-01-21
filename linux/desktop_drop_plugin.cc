@@ -24,6 +24,27 @@ void on_drag_data_received(GtkWidget *widget, GdkDragContext *drag_context,
   auto *channel = static_cast<FlMethodChannel *>(user_data);
   auto *data = gtk_selection_data_get_data(sdata);
   double point[] = {double(x), double(y)};
+
+  // Count items by counting newlines (each file URI is on its own line)
+  int item_count = 0;
+  if (data != nullptr) {
+    const gchar *p = (const gchar *)data;
+    while (*p) {
+      if (*p == '\n') item_count++;
+      p++;
+    }
+    // If data doesn't end with newline, add 1 for the last item
+    if (p > (const gchar *)data && *(p - 1) != '\n') item_count++;
+  }
+
+  // IMMEDIATELY notify Dart that a drop was received (before processing).
+  // This allows the app to show instant feedback like "Preparing import..."
+  auto received_args = fl_value_new_list();
+  fl_value_append(received_args, fl_value_new_int(item_count));
+  fl_value_append(received_args, fl_value_new_float_list(point, 2));
+  fl_method_channel_invoke_method(channel, "dropReceived", received_args,
+                                  nullptr, nullptr, nullptr);
+
   auto args = fl_value_new_list();
   fl_value_append(args, fl_value_new_string((gchar *) data));
   fl_value_append(args, fl_value_new_float_list(point, 2));

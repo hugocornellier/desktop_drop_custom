@@ -18,6 +18,21 @@ class DropDoneDetails {
   final Offset globalPosition;
 }
 
+/// Details provided when a drop is first received, before processing begins.
+@immutable
+class DropReceivedDetails {
+  const DropReceivedDetails({
+    required this.itemCount,
+    required this.localPosition,
+    required this.globalPosition,
+  });
+
+  /// The number of items being processed.
+  final int itemCount;
+  final Offset localPosition;
+  final Offset globalPosition;
+}
+
 class DropEventDetails {
   DropEventDetails({
     required this.localPosition,
@@ -31,6 +46,8 @@ class DropEventDetails {
 
 typedef OnDragDoneCallback = void Function(DropDoneDetails details);
 
+typedef OnDropReceivedCallback = void Function(DropReceivedDetails details);
+
 typedef OnDragCallback<Detail> = void Function(Detail details);
 
 /// A widget that accepts draggable files.
@@ -42,6 +59,7 @@ class DropTarget extends StatefulWidget {
     this.onDragExited,
     this.onDragDone,
     this.onDragUpdated,
+    this.onDropReceived,
     this.enable = true,
   });
 
@@ -58,6 +76,14 @@ class DropTarget extends StatefulWidget {
 
   /// Callback when drag dropped on target area.
   final OnDragDoneCallback? onDragDone;
+
+  /// Callback fired immediately when files are dropped, before processing.
+  ///
+  /// Use this to show instant feedback (e.g., "Preparing import...") while
+  /// the native code processes files in the background. The [DropReceivedDetails]
+  /// includes the count of items being processed. The actual file data will
+  /// arrive later via [onDragDone].
+  final OnDropReceivedCallback? onDropReceived;
 
   /// Whether to enable drop target.
   ///
@@ -153,6 +179,13 @@ class _DropTargetState extends State<DropTarget> {
         globalLocation: globalPosition,
         localLocation: position,
       );
+    } else if (event is DropReceivedEvent && inBounds) {
+      // Immediately notify that a drop was received (before processing completes)
+      widget.onDropReceived?.call(DropReceivedDetails(
+        itemCount: event.itemCount,
+        localPosition: position,
+        globalPosition: globalPosition,
+      ));
     } else if (event is DropDoneEvent &&
         (_status != _DragTargetStatus.idle || UniversalPlatform.isLinux) &&
         inBounds) {

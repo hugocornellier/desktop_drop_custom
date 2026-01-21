@@ -37,3 +37,23 @@ class DropDoneEvent extends DropEvent {
     return '$runtimeType($location, $files)';
   }
 }
+
+/// Event fired immediately when files are dropped, before processing begins.
+///
+/// This allows the app to show instant feedback (e.g., "Preparing import...")
+/// while the native code processes the dropped files in the background.
+/// The [itemCount] indicates how many items are being processed.
+/// The actual file data will arrive later in [DropDoneEvent].
+class DropReceivedEvent extends DropEvent {
+  final int itemCount;
+
+  DropReceivedEvent({
+    required Offset location,
+    required this.itemCount,
+  }) : super(location);
+
+  @override
+  String toString() {
+    return '$runtimeType($location, itemCount: $itemCount)';
+  }
+}

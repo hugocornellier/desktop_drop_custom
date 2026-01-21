@@ -206,6 +206,9 @@ namespace {
     }
 
     HRESULT DesktopDropTarget::Drop(IDataObject *pDataObj, DWORD grfKeyState, POINTL pt, DWORD *pdwEffect) {
+        // Get drop coordinates
+        POINT point = {pt.x, pt.y};
+        ScreenToClient(window_handle_, &point);
 
         flutter::EncodableList list = {};
 
@@ -221,12 +224,26 @@ namespace {
                 PVOID data = GlobalLock(stgmed.hGlobal);
                 if (data != nullptr) {
                     auto files = DragQueryFile(reinterpret_cast<HDROP>(data), 0xFFFFFFFF, nullptr, 0);
+
+                    // IMMEDIATELY notify Dart that a drop was received (before processing).
+                    // This allows the app to show instant feedback like "Preparing import..."
+                    channel_->InvokeMethod("dropReceived", std::make_unique<flutter::EncodableValue>(
+                            flutter::EncodableList{
+                                    flutter::EncodableValue(static_cast<int>(files)),
+                                    flutter::EncodableValue(flutter::EncodableList{
+                                            flutter::EncodableValue(double(point.x)),
+                                            flutter::EncodableValue(double(point.y))
+                                    })
+                            }
+                    ));
+
+                    // Pre-allocate list capacity to avoid reallocations for large drops
+                    list.reserve(files);
                     for (unsigned int i = 0; i < files; ++i) {
                         TCHAR filename[MAX_PATH];
                         DragQueryFile(reinterpret_cast<HDROP>(data), i, filename, sizeof(TCHAR) * MAX_PATH);
                         std::wstring wide(filename);
                         std::string path = ws2s(wide);
-                        std::cout << "done: " << path << std::endl;
                         list.push_back(flutter::EncodableValue(path));
                     }
                     GlobalUnlock(stgmed.hGlobal);

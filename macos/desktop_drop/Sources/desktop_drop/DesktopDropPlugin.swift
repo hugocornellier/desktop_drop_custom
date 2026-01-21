@@ -126,72 +126,118 @@ class DropTarget: NSView {
   override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
     let pb = sender.draggingPasteboard
     let dest = uniqueDropDestination()
-    var items: [[String: Any]] = []
-    var seen = Set<String>()
-    let group = DispatchGroup()
+    let dropLocation = convertPoint(sender.draggingLocation)
 
-    func push(url: URL, fromPromise: Bool) {
-      let path = url.path
-      itemsLock.lock(); defer { itemsLock.unlock() }
+    // IMPORTANT: Read from pasteboard on main thread (required by macOS).
+    // This is fast even for thousands of files.
+    let urls = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+    let legacyList = (pb.propertyList(forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")) as? [String]) ?? []
+    let promiseReceivers = pb.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver]
 
-      // de-dupe safely under lock
-      if !seen.insert(path).inserted { return }
+    // Calculate total item count for immediate feedback
+    let itemCount: Int
+    if !urls.isEmpty || !legacyList.isEmpty {
+      itemCount = urls.count + legacyList.count
+    } else {
+      itemCount = promiseReceivers?.count ?? 0
+    }
 
-      let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
-      let isDirectory: Bool = values?.isDirectory ?? false
+    // IMMEDIATELY notify Dart that a drop was received (before processing starts).
+    // This allows the app to show instant feedback like "Preparing import..."
+    channel.invokeMethod("dropReceived", arguments: [itemCount, dropLocation])
 
-      // Only create a security-scoped bookmark for items outside our container.
+    // Move all heavy processing (file stats, bookmark creation) to background thread
+    // to avoid blocking the UI when dropping thousands of files.
+    DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+      guard let self = self else { return }
+
+      var items: [[String: Any]] = []
+      var seen = Set<String>()
+      let group = DispatchGroup()
+
+      // Pre-compute container paths once (not per-file)
       let bundleID = Bundle.main.bundleIdentifier ?? ""
       let containerRoot = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Containers/\(bundleID)", isDirectory: true)
         .path
       let tmpPath = FileManager.default.temporaryDirectory.path
-      let isInsideContainer = path.hasPrefix(containerRoot) || path.hasPrefix(tmpPath)
 
-      let bmData: Any
-      if isInsideContainer {
-        bmData = NSNull()
-      } else {
-        let bm = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
-        bmData = bm ?? NSNull()
+      // Thread-safe helper to process a single URL
+      func processURL(_ url: URL, fromPromise: Bool) -> [String: Any]? {
+        let path = url.path
+
+        // Check for duplicates under lock
+        self.itemsLock.lock()
+        let isNew = seen.insert(path).inserted
+        self.itemsLock.unlock()
+        if !isNew { return nil }
+
+        // These operations are expensive but now run in parallel on background threads
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
+        let isDirectory: Bool = values?.isDirectory ?? false
+
+        let isInsideContainer = path.hasPrefix(containerRoot) || path.hasPrefix(tmpPath)
+
+        let bmData: Any
+        if isInsideContainer {
+          bmData = NSNull()
+        } else {
+          let bm = try? url.bookmarkData(options: [.withSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+          bmData = bm ?? NSNull()
+        }
+
+        return [
+          "path": path,
+          "apple-bookmark": bmData,
+          "isDirectory": isDirectory,
+          "fromPromise": fromPromise,
+        ]
       }
-      items.append([
-        "path": path,
-        "apple-bookmark": bmData,
-        "isDirectory": isDirectory,
-        "fromPromise": fromPromise,
-      ])
-    }
 
-    // Prefer real file URLs if they exist; only fall back to promises
-    let urls = (pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
-    let legacyList = (pb.propertyList(forType: NSPasteboard.PasteboardType("NSFilenamesPboardType")) as? [String]) ?? []
+      // Prefer real file URLs if they exist; only fall back to promises
+      if !urls.isEmpty || !legacyList.isEmpty {
+        // Combine all URLs for parallel processing
+        let allURLs = urls + legacyList.map { URL(fileURLWithPath: $0) }
 
-    if !urls.isEmpty || !legacyList.isEmpty {
-      // 1) Modern file URLs
-      urls.forEach { push(url: $0, fromPromise: false) }
-      // 2) Legacy filename array used by some apps
-      legacyList.forEach { push(url: URL(fileURLWithPath: $0), fromPromise: false) }
-    } else {
-      // 3) Handle file promises (e.g., VS Code, browsers, Mail)
-      if let receivers = pb.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver],
-         !receivers.isEmpty {
-        for r in receivers {
-          group.enter()
-          r.receivePromisedFiles(atDestination: dest, options: [:], operationQueue: self.workQueue) { url, error in
-            defer { group.leave() }
-            if let error = error {
-              debugPrint("NSFilePromiseReceiver error: \(error)")
-              return
+        // Process files in parallel for maximum performance
+        // Pre-allocate array with placeholders
+        var results = [[String: Any]?](repeating: nil, count: allURLs.count)
+
+        DispatchQueue.concurrentPerform(iterations: allURLs.count) { index in
+          results[index] = processURL(allURLs[index], fromPromise: false)
+        }
+
+        // Collect non-nil results (filtering out duplicates that returned nil)
+        items = results.compactMap { $0 }
+      } else {
+        // Handle file promises (e.g., VS Code, browsers, Mail)
+        // Promises are inherently async, so we use the existing callback mechanism
+        if let receivers = promiseReceivers, !receivers.isEmpty {
+          for r in receivers {
+            group.enter()
+            r.receivePromisedFiles(atDestination: dest, options: [:], operationQueue: self.workQueue) { url, error in
+              defer { group.leave() }
+              if let error = error {
+                debugPrint("NSFilePromiseReceiver error: \(error)")
+                return
+              }
+              if let item = processURL(url, fromPromise: true) {
+                self.itemsLock.lock()
+                items.append(item)
+                self.itemsLock.unlock()
+              }
             }
-            push(url: url, fromPromise: true)
           }
         }
       }
-    }
 
-    group.notify(queue: .main) {
-      self.channel.invokeMethod("performOperation_macos", arguments: items)
+      // Wait for any file promises to complete
+      group.wait()
+
+      // Dispatch back to main thread to invoke Flutter callback
+      DispatchQueue.main.async {
+        self.channel.invokeMethod("performOperation_macos", arguments: items)
+      }
     }
     return true
   }
